@@ -37,11 +37,9 @@ def load_zarr_data(path, mock=False):
         return np.random.rand(50, 100, 100)
 
     if cppzarr:
-        # placeholder for actual cpp_zarr API
-        # expected return: numpy array of shape (X, Y, Z)
-        # We need (Z, Y, X) for processing
-        vol = cppzarr.read_zarr(str(path))
-        return np.transpose(vol, (2, 1, 0))
+        # Placeholder for actual cppzarr API
+        # expected return: numpy array of shape (Z, Y, X) or similar
+        return cppzarr.read_zarr(str(path))
     else:
         raise ImportError("cppzarr is required to load data. Use --mock to test without it.")
 
@@ -103,9 +101,6 @@ def discover_and_group_files(input_dir):
         meta = parse_filename_metadata(f.name)
         if meta['cam'] == "Unknown" and meta['ch'] == "ch?":
             continue # Skip unrelated files
-        
-        # Update full_path to be the actual absolute path found
-        meta['full_path'] = str(f.resolve())
             
         t = meta['time']
         if t not in grouped_data:
@@ -151,21 +146,18 @@ def normalize_volume(volume, p_min, p_max, gamma):
     if gamma != 1.0:
         volume = volume ** gamma
         
-    # Scale to 8-bit
-    volume = (volume * 255).astype(np.uint8)
     return volume
 
-def blend_channel_mips(channel_mips_list, channel_metas):
+def blend_volumes(volumes, channel_metas):
     """
-    Blends a list of MIPs (one from each channel) into a single RGB image.
-    channel_mips_list: [mip_ch0, mip_ch1, ...] where each mip is (Y, X)
-    Returns: (Y, X, 3) float32 RGB image (0-1 range).
+    Blends multiple single-channel volumes into one RGB volume.
+    Simple color mapping based on index or parsing channel name.
     """
-    if not channel_mips_list:
+    if not volumes:
         return None
         
-    y, x = channel_mips_list[0].shape
-    rgb_img = np.zeros((y, x, 3), dtype=np.float32)
+    z, y, x = volumes[0].shape
+    rgb_vol = np.zeros((z, y, x, 3), dtype=np.float32)
     
     # Simple color cycle: R, G, B, C, M, Y
     colors = [
@@ -173,29 +165,27 @@ def blend_channel_mips(channel_mips_list, channel_metas):
         [0, 1, 1], [1, 0, 1], [1, 1, 0]
     ]
     
-    for i, (mip, meta) in enumerate(zip(channel_mips_list, channel_metas)):
+    for i, (vol, meta) in enumerate(zip(volumes, channel_metas)):
         color = np.array(colors[i % len(colors)])
-        
-        # mip is uint8 (0-255). Convert to float 0-1 for blending
-        mip_float = mip.astype(np.float32) / 255.0
-        
         # Additive blending
-        # Resizing color to (1,1,3) to broadcast
-        weighted = mip_float[..., np.newaxis] * color
-        rgb_img += weighted
+        # Resizing color to (1,1,1,3) to broadcast
+        # vol is (Z, Y, X) -> (Z, Y, X, 1)
+        weighted = vol[..., np.newaxis] * color
+        rgb_vol += weighted
         
     # Clip sum to 1.0
-    rgb_img = np.clip(rgb_img, 0, 1)
-    return rgb_img
+    rgb_vol = np.clip(rgb_vol, 0, 1)
+    return rgb_vol
 
-def create_slabs_mip(volume, slab_size=None, num_slabs=None):
+def create_slabs_mip(rgb_volume, slab_size=None, num_slabs=None):
     """
-    Splits a single-channel volume into slabs along Z and computes MIP for each.
-    volume: (Z, Y, X)
-    Returns: list of 2D images (Y, X).
+    Splits volume into slabs along Z and computes MIP for each.
+    If num_slabs is provided, it overrides slab_size.
+    Extra planes (remainder) are distributed to first and last slabs.
+    Returns: list of RGB images (Y, X, 3).
     """
     slabs = []
-    z_dim = volume.shape[0]
+    z_dim = rgb_volume.shape[0]
     
     # Determine slab boundaries
     edges = [0]
@@ -391,9 +381,8 @@ def run_movie_generation(args):
             print(f"Processing timepoint {item['time_msec']} ms ({t_idx+1}/{len(timeline)})...")
             
             # Load Data
-            processed_volumes = [] # Keep for FFT (uint8)
+            volumes = []
             raw_sums = []
-            channel_slabs_list = [] # List of list of mips: [ [ch0_slab0, ch0_slab1], [ch1_slab0...] ]
             
             for f_meta in item['channels']:
                 try:
@@ -406,32 +395,24 @@ def run_movie_generation(args):
                     # Store stats on raw-ish data (after BG sub)
                     raw_sums.append(np.sum(vol_bg))
                     
-                    # 2. Normalize and Convert to 8-bit
+                    # 2. Normalize
                     vol_norm = normalize_volume(vol_bg, args.contrast_percentiles[0], args.contrast_percentiles[1], args.gamma)
-                    processed_volumes.append(vol_norm)
-                    
-                    # 3. Create Slabs (MIPs) immediately per channel to save memory? 
-                    # Actually we still keep `vol_norm` in memory for FFT.
-                    # But we don't build the huge RGB volume anymore.
-                    slabs = create_slabs_mip(vol_norm, slab_size=args.slab_size, num_slabs=args.num_slabs)
-                    channel_slabs_list.append(slabs)
+                    volumes.append(vol_norm)
                     
                 except Exception as e:
                     print(f"Failed to load {f_meta['full_path']}: {e}")
-                    # Handle missing channel
-                    dummy_vol = np.zeros((10,10,10), dtype=np.uint8)
-                    processed_volumes.append(dummy_vol)
+                    # Handle missing channel?
+                    volumes.append(np.zeros((10,10,10), dtype=np.float32)) 
                     raw_sums.append(0)
-                    channel_slabs_list.append([np.zeros((10,10), dtype=np.uint8)])
 
             # Init global stats on first run
             if t_idx == 0:
-                num_channels = len(processed_volumes)
+                num_channels = len(volumes)
                 bleaching_history = [[] for _ in range(num_channels)]
                 
                 # Check shapes
-                if processed_volumes:
-                    z_shape, y_shape, x_shape = processed_volumes[0].shape
+                if volumes:
+                    z_shape, y_shape, x_shape = volumes[0].shape
                     print(f"Volume shape: {z_shape, y_shape, x_shape}")
 
             # Update Bleaching History
@@ -440,24 +421,9 @@ def run_movie_generation(args):
                     bleaching_history[c_i].append(val)
 
             # --- Panel 1: MIPs ---
-            # Blend the MIPs
-            final_rgb_mips = []
-            if channel_slabs_list:
-                num_generated_slabs = len(channel_slabs_list[0])
-                for s_i in range(num_generated_slabs):
-                    # Gather the s_i-th slab from every channel
-                    slabs_to_blend = []
-                    for ch_slabs in channel_slabs_list:
-                        if s_i < len(ch_slabs):
-                            slabs_to_blend.append(ch_slabs[s_i])
-                        else:
-                            # Should not happen if geometry matches
-                            slabs_to_blend.append(None) # blend handles missing? No, assume match
-                            
-                    rgb_slab = blend_channel_mips(slabs_to_blend, item['channels'])
-                    final_rgb_mips.append(rgb_slab)
-            
-            mips_img = arrange_mips(final_rgb_mips, args.voxel_size)
+            rgb_composite = blend_volumes(volumes, item['channels'])
+            slabs = create_slabs_mip(rgb_composite, slab_size=args.slab_size, num_slabs=args.num_slabs)
+            mips_img = arrange_mips(slabs, args.voxel_size)
             
             ax_mips.clear()
             ax_mips.imshow(mips_img)
@@ -479,7 +445,7 @@ def run_movie_generation(args):
                                  f"{bar_len_um} um", color='white', ha='left')
 
             # --- Panel 2: FFT ---
-            sum_vol = np.sum(np.array(processed_volumes), axis=0) 
+            sum_vol = np.sum(np.array(volumes), axis=0) 
             fft_xy, fft_xz, fft_yz = compute_fft_planes(sum_vol)
             
             # Combine planes
