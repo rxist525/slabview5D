@@ -8,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib.colors import LogNorm
 from scipy.fft import fftn, fftshift
 
 # Try to import cppzarr, otherwise mock for dry-run/dev if not present
@@ -188,16 +189,10 @@ def blend_channel_mips(channel_mips_list, channel_metas):
     rgb_img = np.clip(rgb_img, 0, 1)
     return rgb_img
 
-def create_slabs_mip(volume, slab_size=None, num_slabs=None):
+def get_slab_edges(z_dim, slab_size=None, num_slabs=None):
     """
-    Splits a single-channel volume into slabs along Z and computes MIP for each.
-    volume: (Z, Y, X)
-    Returns: list of 2D images (Y, X).
+    Calculates Z-positions for slab boundaries.
     """
-    slabs = []
-    z_dim = volume.shape[0]
-    
-    # Determine slab boundaries
     edges = [0]
     
     if num_slabs is not None and num_slabs > 0:
@@ -217,11 +212,7 @@ def create_slabs_mip(volume, slab_size=None, num_slabs=None):
                 size += rem_last
             
             # Ensure size is at least 1 if z_dim >= num_slabs
-            # (If z_dim < num_slabs, some slabs might be empty or handling needed? 
-            # Assuming z_dim >= num_slabs for logical slicing)
             if size == 0 and z_dim < num_slabs:
-                 # Fallback for edge cases where requested slabs > z thickness?
-                 # Just make 1-slice slabs until out of data?
                  pass 
             
             current_z += size
@@ -235,9 +226,20 @@ def create_slabs_mip(volume, slab_size=None, num_slabs=None):
             edges.append(next_z)
             current_z += slab_size
             if current_z >= z_dim and edges[-1] != z_dim:
-                 # If loop condition met but last edge wasn't added?
-                 # Logic above adds next_z.
                  break
+    return edges
+
+def create_slabs_mip(volume, slab_size=None, num_slabs=None):
+    """
+    Splits a single-channel volume into slabs along Z and computes MIP for each.
+    volume: (Z, Y, X)
+    Returns: list of 2D images (Y, X).
+    """
+    slabs = []
+    z_dim = volume.shape[0]
+    
+    z_dim = volume.shape[0]
+    edges = get_slab_edges(z_dim, slab_size, num_slabs)
 
     # Extract MIPs based on edges
     # Edges: [0, z1, z2, ..., z_dim]
@@ -246,20 +248,19 @@ def create_slabs_mip(volume, slab_size=None, num_slabs=None):
         end = edges[i+1]
         
         if end > start:
-            sub_vol = rgb_volume[start:end]
+            sub_vol = volume[start:end]
             mip = np.max(sub_vol, axis=0)
             slabs.append(mip)
             
     return slabs
 
-def arrange_mips(mips, voxel_size):
+def arrange_mips(mips, voxel_size, border_width=2):
     """
-    Juxtaposes MIPs into a single image.
-    Strategy: Best-fit grid (sqrt(N)).
-    Also draws scale bar (handled at plotting time is easier, but here we prep the image).
+    Juxtaposes MIPs into a single image with borders.
+    Returns: (grid_image, (rows, cols, cell_h, cell_w))
     """
     if not mips:
-        return None
+        return None, (0,0,0,0)
         
     n = len(mips)
     cols = int(np.ceil(np.sqrt(n)))
@@ -267,14 +268,22 @@ def arrange_mips(mips, voxel_size):
     
     y, x, c = mips[0].shape
     
-    grid_img = np.zeros((rows * y, cols * x, c), dtype=np.float32)
+    cell_h = y + 2 * border_width
+    cell_w = x + 2 * border_width
+    
+    grid_img = np.zeros((rows * cell_h, cols * cell_w, c), dtype=np.float32)
+    grid_img.fill(1.0) # White background/border
     
     for idx, mip in enumerate(mips):
         r = idx // cols
         c_idx = idx % cols
-        grid_img[r*y : (r+1)*y, c_idx*x : (c_idx+1)*x, :] = mip
         
-    return grid_img
+        y0 = r * cell_h + border_width
+        x0 = c_idx * cell_w + border_width
+        
+        grid_img[y0 : y0+y, x0 : x0+x, :] = mip
+        
+    return grid_img, (rows, cols, cell_h, cell_w)
 
 def compute_bleaching_stats(raw_volumes):
     """
@@ -284,6 +293,52 @@ def compute_bleaching_stats(raw_volumes):
     for vol in raw_volumes:
         stats.append(np.sum(vol))
     return stats
+
+    return stats
+
+def compute_fft_planes_norm(volume):
+    """
+    Computes 3D FFT, normalizes by DC, and extracts principal planes.
+    Returns magnitude normalized to DC=1.
+    """
+    if volume is None:
+        return None, None, None
+        
+    # FFT
+    f = fftn(volume)
+    fshift = fftshift(f)
+    
+    # Magnitude
+    magnitude = np.abs(fshift)
+    
+    # Normalize by max (DC component)
+    mx = np.max(magnitude)
+    if mx > 0:
+        magnitude /= mx
+        
+    z, y, x = magnitude.shape
+    
+    # Principal planes
+    # XY (at mid Z)
+    # XZ (at mid Y)
+    # YZ (at mid X) -> We extract (Z, Y) slice at mid X.
+    # The plot expects Z vertical, Y horizontal usually?
+    # User requested: "ky/kz panel to the right of kx/ky".
+    # Standard: kx horizontal, ky vertical.
+    # To right: kx becomes kz? No, standard is [x, y], [x, z], [z, y]
+    # Let's extract them directly first.
+    
+    fft_xy = magnitude[z//2, :, :]   # (Y, X) - displays as Ky (vert), Kx (horiz)
+    fft_xz = magnitude[:, y//2, :]   # (Z, X) - displays as Kz (vert), Kx (horiz)
+    fft_yz = magnitude[:, :, x//2]   # (Z, Y) - displays as Kz (vert), Ky (horiz)
+    
+    return fft_xy, fft_xz, fft_yz
+
+def get_fft_extent(voxel_size, shape):
+    """
+    Returns fixed extent [-1, 1] as requested.
+    """
+    return [-1, 1, -1, 1], [-1, 1, -1, 1], [-1, 1, -1, 1]
 
 def compute_fft_planes(volume):
     """
@@ -326,6 +381,12 @@ def combine_ppt_planes(xy, xz, yz):
     full_img = np.hstack([pad_to_h(xy, target_h), pad_to_h(xz, target_h), pad_to_h(yz, target_h)])
     return full_img
 
+def format_msec(msec):
+    """Formats milliseconds to HH:MM:SS string."""
+    seconds = int(msec / 1000)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def run_movie_generation(args):
     """
@@ -365,16 +426,45 @@ def run_movie_generation(args):
     plt.switch_backend('Agg')
     
     dpi = 100
-    fig = plt.figure(figsize=(18, 10), constrained_layout=True)
-    gs = fig.add_gridspec(2, 3) 
     
-    ax_mips = fig.add_subplot(gs[:, 0:2])
-    ax_fft = fig.add_subplot(gs[0, 2])
-    ax_bleach = fig.add_subplot(gs[1, 2])
+    # Prepare Video Writer
+    plt.switch_backend('Agg')
+    
+    dpi = 100
+    # Layout:
+    # Row 0: MIPs (spanning 2 cols), FFT XY, FFT YZ
+    # Row 1: Bleach (spanning 2 cols), FFT XZ, (Empty or Legend?)
+    # Actually user asked for specific FFT layout relative to each other.
+    # "kx/kz panel below the kx/ky panel"
+    # "ky/kz panel to the right of the kx/ky panel"
+    
+    # Let's make a custom grid.
+    # Col 0-1: Image
+    # Col 2: FFT col 1
+    # Col 3: FFT col 2
+    
+    # Layout: 1920x1080 -> 4K 3840x2160
+    # Figsize in inches: 38.4 x 21.6 at 100 dpi
+    fig = plt.figure(figsize=(38.4, 21.6), dpi=100)
+    
+    # Grid: Main (Slabs) vs Sidebar (Analysis)
+    # Width ratios: Slabs take ~85-90%, Sidebar ~10-15%
+    # Using [6, 1] gives 1/7th ~ 14% width for sidebar
+    gs_main = fig.add_gridspec(1, 2, width_ratios=[6, 1], wspace=0.02)
+    
+    # Left: MIPs
+    ax_mips = fig.add_subplot(gs_main[0])
+    
+    # Right: Sidebar with vertical stack
+    # 3 FFT panels + 1 Bleaching panel = 4 rows
+    gs_side = gs_main[1].subgridspec(4, 1, hspace=0.15)
+    
+    ax_fft_xy = fig.add_subplot(gs_side[0])
+    ax_fft_yz = fig.add_subplot(gs_side[1]) # Stacked vertically
+    ax_fft_xz = fig.add_subplot(gs_side[2])
+    ax_bleach = fig.add_subplot(gs_side[3])
     
     ax_mips.axis('off')
-    ax_fft.set_title("FFT Principal Planes (XY | XZ | YZ)")
-    ax_fft.axis('off')
     
     # Writer
     writer = animation.FFMpegWriter(fps=5, metadata=dict(artist='Antigravity'), bitrate=3000)
@@ -386,9 +476,14 @@ def run_movie_generation(args):
     
     with writer.saving(fig, args.output, dpi=dpi):
         num_channels = 0 
+        start_time_msec = timeline[0]['time_msec'] if timeline else 0
         
         for t_idx, item in enumerate(timeline):
-            print(f"Processing timepoint {item['time_msec']} ms ({t_idx+1}/{len(timeline)})...")
+            current_msec = item['time_msec']
+            rel_msec = current_msec - start_time_msec
+            time_str = format_msec(rel_msec)
+            
+            print(f"Processing timepoint {current_msec} ms ({time_str}) ({t_idx+1}/{len(timeline)})...")
             
             # Load Data
             processed_volumes = [] # Keep for FFT (uint8)
@@ -457,12 +552,39 @@ def run_movie_generation(args):
                     rgb_slab = blend_channel_mips(slabs_to_blend, item['channels'])
                     final_rgb_mips.append(rgb_slab)
             
-            mips_img = arrange_mips(final_rgb_mips, args.voxel_size)
+            mips_img, grid_geom = arrange_mips(final_rgb_mips, args.voxel_size, border_width=2)
+            rows, cols, cell_h, cell_w = grid_geom
             
             ax_mips.clear()
             ax_mips.imshow(mips_img)
-            ax_mips.set_title(f"Time: {item['time_msec']} ms")
+            ax_mips.set_title(f"Time: {time_str} | Frame: {t_idx}", fontsize=24)
             ax_mips.axis('off')
+
+            # Add Z-range labels and scale bar
+            if processed_volumes and final_rgb_mips:
+                # Recalculate edges for labeling
+                z_dim = processed_volumes[0].shape[0]
+                edges = get_slab_edges(z_dim, args.slab_size, args.num_slabs)
+                z_res = args.voxel_size[2] # Z is index 2
+                
+                rows, cols, cell_h, cell_w = grid_geom
+                
+                for s_idx in range(len(final_rgb_mips)):
+                    if s_idx < len(edges) - 1:
+                        z_start = edges[s_idx] * z_res
+                        z_end = edges[s_idx+1] * z_res
+                        
+                        r = s_idx // cols
+                        c_idx = s_idx % cols
+                        
+                        # Position text above the tile (Top Left)
+                        # Left edge + offset
+                        text_x = c_idx * cell_w + 40 
+                        text_y = r * cell_h + 40 # Top offset
+                        
+                        ax_mips.text(text_x, text_y, f"{z_start:.1f}-{z_end:.1f} \u00b5m", 
+                                     color='white', ha='left', va='top', fontsize=24, 
+                                     bbox=dict(facecolor='black', alpha=0.5, edgecolor='none'))
             
             # Scale bar
             if args.voxel_size[0] > 0 and mips_img is not None:
@@ -471,24 +593,64 @@ def run_movie_generation(args):
                 bar_len_px = bar_len_um / args.voxel_size[0]
                 
                 # Draw if fits
+                # Position: Bottom Left of FIRST slab (r=0, c=0).
+                # x ~ 40, y ~ cell_h - 40
                 if bar_len_px < mips_img.shape[1]:
-                    rect = plt.Rectangle((mips_img.shape[1] - bar_len_px - 20, mips_img.shape[0] - 20), 
-                                         bar_len_px, 5, color='white')
+                    rows, cols, cell_h, cell_w = grid_geom
+                    # Bar at bottom left of first tile
+                    rect = plt.Rectangle((40, cell_h - 40), 
+                                         bar_len_px, 15, color='red')
                     ax_mips.add_patch(rect)
-                    ax_mips.text(mips_img.shape[1] - bar_len_px - 20, mips_img.shape[0] - 30, 
-                                 f"{bar_len_um} um", color='white', ha='left')
+                    # Text above bar (Red)
+                    ax_mips.text(40 + bar_len_px/2, cell_h - 70, 
+                                 f"{bar_len_um} \u00b5m", color='red', ha='center', va='bottom', fontsize=24)
 
             # --- Panel 2: FFT ---
-            sum_vol = np.sum(np.array(processed_volumes), axis=0) 
-            fft_xy, fft_xz, fft_yz = compute_fft_planes(sum_vol)
+            if processed_volumes:
+                sum_vol = np.sum(np.array(processed_volumes), axis=0)
+                # Compute Norm FFT
+                f_xy, f_xz, f_yz = compute_fft_planes_norm(sum_vol)
+                
+                # Extents
+                # voxel_size is [x, y, z]
+                ext_xy, ext_xz, ext_yz = get_fft_extent(args.voxel_size, sum_vol.shape)
+                
+                # Labels
+                k_label = r"$k / (4\pi n / \lambda_{exc})$"
+                
+                # XY: kx (H), ky (V)
+                ax_fft_xy.clear()
+                ax_fft_xy.imshow(f_xy, cmap='jet', extent=ext_xy, 
+                                 norm=LogNorm(vmin=0.01, vmax=1), origin='lower')
+                ax_fft_xy.set_ylabel("ky")
+                ax_fft_xy.set_xticklabels([]) # Hide X labels for compactness in stack
+                ax_fft_xy.set_aspect('auto')
+
+                # YZ: kz (H), ky (V)
+                # Transposed to match ky vertical if adjacent, but here stacked.
+                # Let's keep consistent axes labels.
+                f_yz_cj = f_yz.T 
+                ax_fft_yz.clear()
+                ax_fft_yz.imshow(f_yz_cj, cmap='jet', extent=ext_yz, 
+                                 norm=LogNorm(vmin=0.01, vmax=1), origin='lower')
+                ax_fft_yz.set_ylabel("ky")
+                ax_fft_yz.set_xticklabels([])
+                ax_fft_yz.set_aspect('auto')
+
+                # XZ: kx (H), kz (V)
+                ax_fft_xz.clear()
+                ax_fft_xz.imshow(f_xz, cmap='jet', extent=ext_xz, 
+                                 norm=LogNorm(vmin=0.01, vmax=1), origin='lower')
+                ax_fft_xz.set_xlabel(k_label)
+                ax_fft_xz.set_ylabel("kz")
+                ax_fft_xz.set_aspect('auto')
+                
+                # No colorbar to save sidebar space or add one tight?
+                # "include the optimized FFT and bleaching panels"
+                # Colorbar might crowd 15% width. Let's omit or make very small inside plot?
+                # Let's stick to data for now.
             
-            # Combine planes
-            fft_combined = combine_ppt_planes(fft_xy, fft_xz, fft_yz)
-            
-            ax_fft.clear()
-            ax_fft.imshow(fft_combined, cmap='inferno')
-            ax_fft.set_title("FFT (XY | XZ | YZ)")
-            ax_fft.axis('off')
+            # --- Panel 3: Bleaching ---
             
             # --- Panel 3: Bleaching ---
             ax_bleach.clear()
@@ -505,11 +667,12 @@ def run_movie_generation(args):
                     if c_meta['cam'] != "Unknown":
                         label = f"{c_meta['cam']}_{c_meta['ch']}"
                     
+                
                 ax_bleach.plot(times, vals, label=label)
             
-            ax_bleach.set_title("Bleaching (Norm)")
+            ax_bleach.set_title("Bleaching")
             ax_bleach.set_xlabel("Time (ms)")
-            ax_bleach.legend(fontsize='small')
+            # ax_bleach.legend(fontsize='small') # Might crowd the small subplot
             
             writer.grab_frame()
             
