@@ -1,0 +1,42 @@
+% Read new data from CSV exported from Google Sheets - csv
+% https://docs.google.com/spreadsheets/d/1csVTFWmKXgol-eCuJjrpSX2T1hwiVv0or7f80AfQTII/edit?gid=0#gid=0
+rt = 'V:\Gokul\ImageAnalysis\gitRepos\slabview5D';
+cd(rt)
+fn = '2025_mosaic_roi_folder_summary_v7_1216_downloaded_20260127.csv';
+mdata2025 = readtable([rt filesep fn], 'TextType','string'); % or detect variable types
+
+% Ensure the Key column is string (or categorical/char) for comparison
+mdata2025.roi_folder = string(mdata2025.roi_folder);
+
+% Convert table rows to struct array (one struct per row)
+CO_db = table2struct(mdata2025, 'ToScalar', false); % returns 1xM struct array
+lastupdate = datetime;
+
+p = arrayfun(@(x) ['/clusterfs/vast/abcabc/' + x.roi_folder], CO_db); % linux path
+[CO_db.path] = deal(p{:});
+
+p = arrayfun(@(x) ['X:\abcabc\' + x.roi_folder], CO_db); % windows path
+[CO_db.winpath] = deal(p{:});
+
+for k = 1:numel(CO_db)
+    CO_db(k).chromaticCorrection = false;
+    CO_db(k).chromaticOffset = [];
+
+    CO_db(k).unmix = false;
+    CO_db(k).unmixingFactor = [];
+
+    CO_db(k).stitched = false;
+
+    CO_db(k).decon = false;
+    CO_db(k).dsr = false;
+    CO_db(k).dsrCrop = false;
+
+    CO_db(k).denoise = false;
+
+    CO_db(k).imaris = false;
+    CO_db(k).skipDir = false;
+end
+
+ts = datestr(now,'yyyymmdd_HHMMSS');
+fname = [rt filesep 'CO_database_' ts '.mat'];
+save(fname, 'CO_db', 'lastupdate', '-v7.3'); % use -v7.3 if large
